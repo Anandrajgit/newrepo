@@ -1,0 +1,125 @@
+import json
+import os
+import sys
+from json import JSONDecodeError
+from importlib.resources import files
+
+from cicd_tool import log
+from . import util
+
+_config = None
+
+
+class CMConfig:
+    def __init__(self, filename=None):
+        self.filename = filename or 'cm-ticket.json'
+
+    def __call__(self, path=None, default=None):
+        config = self._get_config(self.filename)
+        if not path:
+            return config
+
+        value = util.pick(path, config)
+
+        if value is None:
+            return default
+        else:
+            return value
+
+    def require(self, *paths, fatal=True):
+        def empty(v):
+            return not (v or isinstance(v, (int, float, bool)))
+
+        items = {path: self(path) for path in paths}
+        items_empty = [key for key, value in items.items() if empty(value)]
+
+        if not items_empty:
+            return items.values()
+
+        errors = [f'<{item}> empty' for item in items_empty]
+        errors.insert(0, CONFIG.filename)
+
+        if fatal:
+            assert False, errors
+
+    @util.cached
+    def _get_config(self, filename):
+        config_path = self._get_config_path(filename)
+        if not os.path.exists(config_path):
+            log.error(f'{config_path} not found')
+            print()
+            exit(1)
+
+        try:
+            with open(config_path) as file:
+                config = json.load(file)
+        except JSONDecodeError as e:
+            log.error(filename)
+            log.error(f'{e.msg} <line {e.lineno}:{e.colno}>')
+            print()
+            exit(1)
+
+        if 'extends' in config:
+            extends = self._get_config(config['extends'])
+            config = self._merge_config(extends, config)
+
+        return config
+
+    @util.cached
+    def _get_config_path(self, filename):
+        packaged_templates = files('cicd_tool.cm_tickets.templates')
+        if packaged_templates.is_dir() and os.path.exists(os.path.join(packaged_templates, filename)):
+            path = packaged_templates
+        else:
+            if not os.path.isdir(filename):
+                path = os.path.dirname(filename)
+
+        return os.path.join(path, filename)
+
+    def _merge_config(self, a, b):
+        if not isinstance(a, dict):
+            return b
+        if not isinstance(b, dict):
+            return b
+
+        a_keys = list(a.keys() if a else [])
+        b_keys = list(b.keys() if b else [])
+        keys = list(a_keys)
+
+        for b_key in b_keys:
+            if b_key not in keys:
+                keys.append(b_key)
+
+        result = {}
+        for key in keys:
+            if key not in b_keys:
+                value = a[key]
+            elif key not in a_keys:
+                value = b[key]
+            else:
+                value = self._merge_config(a[key], b[key])
+
+            result[key] = value
+
+        return result
+
+
+CONFIG = CMConfig()
+
+_TRANSITION_IDS = {
+    'cm-review': 11,
+    'start-test': 21,
+    'info-needed': 61,
+    'promote': 31,
+    'defect': 111,
+    'go': 41,
+    'no-go': 251,
+    'it-worked': 121,
+    'how-did-it-go': 131,
+    'end-result': 141,
+    're-open': 151,
+    're-close': 281,
+    'rectify-outcome': 271,
+    'rollback': 161,
+    'cancel-issue': 171
+}
