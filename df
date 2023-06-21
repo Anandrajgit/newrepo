@@ -1,0 +1,372 @@
+import json
+import re
+from datetime import datetime, date
+
+import click
+from jira import JIRAError
+
+from cicd_tool import log
+from cicd_tool.atlassian_utils.jira import JiraClient
+from cicd_tool.cm_tickets.util import get_field_data_from_git, sanitize
+from cicd_tool.slack_util import SlackClient
+
+from .config import CMConfig
+from .template import Templater
+
+TEMPLATE = Templater()
+CONFIG = CMConfig()
+
+JIRA = JiraClient()
+SLACK = SlackClient()
+
+
+@click.group()
+@click.option('--config', '-c',
+    required=False,
+    default='cm-ticket.json',
+    show_default=True
+)
+@click.option('--debug',
+    is_flag=True,
+    required=False,
+    default=False,
+    show_default=True,
+    help='Enable debug logging'
+)
+@click.option('--dryrun',
+    is_flag=True,
+    required=False,
+    default=False,
+    show_default=True,
+    help='Run in "dryrun" mode. Output will show what would change, but no changes will be made.'
+)
+@click.option('--user', '-u',
+    required=True,
+    help='JIRA Username'
+)
+@click.option('--pswd', '-p',
+    required=True,
+    help='JIRA Password'
+)
+@click.option('--token',
+    required=False,
+    default=None,
+    help='Slack Bot Token'
+)
+def cli(config, debug: bool, dryrun: bool, user: str, pswd: str, token: str):
+    log.set_debug(debug)
+    CONFIG.filename = config
+
+    # Set the JIRA username and password
+    JIRA._user = user
+    JIRA._pswd = pswd
+
+    # Set the slack token
+    SLACK._token = token
+
+    # Enable dryrun
+    if dryrun:
+        JIRA._noop = dryrun
+        SLACK._noop = dryrun
+        log.warn('(dryrun) No changes will be made')
+        print()
+
+
+def init(version=None):
+    if version:
+        version = version.strip()
+        version_pattern = CONFIG('version-pattern')
+
+        assert re.fullmatch(version_pattern, version), (
+            version_pattern,
+            f'version "{version}" invalid',
+        )
+
+        TEMPLATE['version'] = version
+        TEMPLATE['issue'] = find_cm_ticket(version)
+
+    use_pretty = CONFIG('pretty', False)
+    log.set_pretty(use_pretty)
+
+    TEMPLATE.timestamp()
+    return version
+
+
+@cli.command()
+@click.argument('version')
+@click.argument('exclude_commits_from_branch', required=False)
+def create(version: str, exclude_commits_from_branch: str):
+    version = init(version)
+    ticket = TEMPLATE.get('issue')
+
+    if ticket:
+        log.warn(f'{ticket.field("summary")} already exists: https://workflow.ghx.com/browse/{ticket.key}')
+        exit(0)
+
+    CONFIG.require('issue.project', 'issue.issuetype', 'issue.summary')
+    fields = CONFIG('issue')
+    fields = TEMPLATE(fields)
+
+    assert version in fields['summary'], (
+        '<summary> invalid',
+        f'version "{version}" missing'
+    )
+
+    if exclude_commits_from_branch:
+        release_story_keys, author_username = get_field_data_from_git(exclude_commits_from_branch)
+        # Add the stories to the Business Purpose field
+        if len(release_story_keys) > 0:
+            fields['Business Purpose'] = ["This release has the following JIRA Stories:"] + release_story_keys
+
+        # Set the CM: Implementer field
+        fields['assignee'] = author_username
+        fields['CM: Implementer'] = author_username
+
+    log.data(fields)
+
+    ticket = JIRA.create(fields)
+
+    log.success(f'https://workflow.ghx.com/browse/{ticket.key}')
+    log.success(f'{ticket.field("summary")} created')
+    print()
+
+
+@cli.command()
+@click.argument('version')
+@click.argument('transition', required=False)
+def update(version: str, transition: str):
+    version = init(version)
+    transition = sanitize(transition)
+
+    ticket = TEMPLATE.get('issue')
+    assert ticket, f'version "{version}" missing'
+
+    transition_id = None
+    transition_name = None
+    transition_title = None
+    available = JIRA.transition(ticket.key)
+
+    if transition:
+        for tx_id in available:
+            tx_title = available[tx_id]
+            tx_name = sanitize(tx_title)
+            if tx_name == transition or tx_id == transition:
+                transition_id = tx_id
+                transition_name = tx_name
+                transition_title = tx_title
+                break
+
+        if not transition_id:
+            log.data({f'{log.CYAN("NEXT")} transition': available})
+            assert False, f'transition "{transition}" invalid'
+
+        config = CONFIG(f'transition.{transition_name}') or {}
+        config = TEMPLATE(config)
+
+        fields = config.get('fields', None)
+        if transition == "it-worked":
+            fields['Production Deployment Date'] = date.today()
+
+        comment = config.get('comment', None)
+        slack = config.get('slack', None)
+        slack_channel = CONFIG('slack.channel') if slack else None
+
+        if isinstance(comment, list):
+            comment = '\n'.join(comment)
+        if isinstance(slack, list):
+            slack = '\n'.join(slack)
+
+        prefix = log.CYAN('WITH')
+
+        log.data({
+            f'{prefix} transition': {transition_id: available[transition_id]},
+            f'{prefix} fields': fields,
+            f'{prefix} comment': comment.split('\n') if comment else None,
+            f'{prefix} slack': slack.split('\n') if slack else None
+        })
+
+        available = JIRA.transition(
+            ticket.key,
+            transition_id,
+            fields=fields,
+            comment=comment
+        )
+        log.success(transition_title)
+
+        if slack:
+            send_slack(slack_channel, slack)
+        print()
+
+    log.data({f'{log.CYAN("NEXT")} transition': available})
+
+
+def send_slack(channel, message: str):
+    if not channel:
+        log.error('<slack.channel> missing')
+        return
+
+    if not message:
+        log.error('<message> empty')
+        return
+
+    channel_name = str(channel['name'])
+    if not channel_name.startswith('#'):
+        channel_name = '#' + channel_name
+
+    SLACK.send(channel_name, message)
+    log.success(f"Sent message to channel {log.CYAN(channel['name'])}")
+
+
+@cli.command()
+@click.argument('version')
+@click.argument('message', required=True)
+def note(version: str, message: str):
+    version = init(version)
+
+    ticket = TEMPLATE.get('issue')
+    assert ticket, f'version "{version}" missing'
+
+    if message:
+        JIRA.comment(ticket.key, message)
+        log.success(f'Added comment to {ticket.key}')
+    print()
+
+
+@cli.command()
+@click.argument('version')
+def delete(version: str):
+    version = init(version)
+
+    ticket = TEMPLATE.get('issue')
+    assert ticket, f'version "{version}" missing'
+
+    log.warn(f"Deleting CM Ticket {ticket.key}...")
+    JIRA.delete(ticket.key)
+
+    log.success(f'https://workflow.ghx.com/browse/{ticket.key}')
+    log.success(f'{ticket.field("summary")} deleted')
+    print()
+
+
+@cli.command('list')
+def _list():
+    init()
+
+    config = CONFIG('issue')
+    get_required_fields(
+        config, 'summary', 'issuetype', 'project',
+        filename=CONFIG.filename,
+        path='issue'
+    )
+
+    project = config.get('project')
+    issuetype = config.get('issuetype')
+    summary = config.get('summary')
+
+    tickets = JIRA.search(
+        f"""
+        project="{project}" AND
+        issuetype="{issuetype}" AND
+        summary~"{TEMPLATE(summary, version='*')}"
+        ORDER BY "Change Activity Date and Time" DESC
+        """
+    )
+
+    summary_re = TEMPLATE(summary, version='__VERSION__')
+    summary_re = re.sub(r'[^a-zA-Z0-9 _]', lambda m: '\\' + m.group(0), summary_re)
+    summary_re = summary_re.replace('__VERSION__', '(.*)')
+    summary_re = re.compile(summary_re, re.IGNORECASE)
+
+    for ticket in reversed(tickets):
+        summary = ticket.field('summary')
+        match = summary_re.fullmatch(summary)
+        if not match: continue
+
+        version = match.group(1)
+        summary = summary.replace(version, log.MAGENTA(version))
+
+        date = datetime.strptime(ticket.field('customfield_18141'), '%Y-%m-%dT%H:%M:%S.000%z')
+        date = date.strftime('%Y-%m-%d')
+
+        log.data({
+            summary: (
+                ticket.key,
+                date
+            )
+        })
+
+
+def find_cm_ticket(version):
+    config = CONFIG('issue')
+    get_required_fields(
+        config, 'summary',
+        filename=CONFIG.filename,
+        path='issue'
+    )
+
+    summary = config.get('summary')
+    summary = TEMPLATE(summary, version=version)
+    return JIRA.find('CM', summary)
+
+
+def assert_is_object(obj, filename=None, path=None):
+    if hasattr(obj, '__dict__'):
+        obj = obj.__dict__
+
+    if isinstance(obj, dict):
+        return obj
+
+    errors = [
+        str(obj),
+        f'<{path}> expected object' if path else 'expected object'
+    ]
+
+    if filename:
+        errors.insert(0, filename)
+
+    assert False, errors
+
+
+def get_required_fields(obj, *fields, filename=None, path=None):
+    obj = assert_is_object(obj, filename=filename, path=path)
+    errors = [key for key in fields if key not in obj or obj[key] is None]
+
+    if not errors:
+        return tuple(obj[field] for field in fields)
+
+    for i, field in enumerate(errors):
+        if path:
+            field = f'{path}.{field}'
+
+        field = f'<{field}> missing'
+        errors[i] = field
+
+    if filename:
+        errors.insert(0, filename)
+
+    assert False, errors
+
+
+def main():
+    try:
+        print()
+        cli()
+    except JIRAError as error:
+        error_json = json.loads(error.response.content)
+        log.error(f'JIRA Response [{error.status_code}]\n')
+        log.data(error_json, log.RED)
+        exit(1)
+    except AssertionError as error:
+        args = error.args[0]
+        if not isinstance(args, (list, tuple)):
+            args = [args]
+
+        for arg in args:
+            log.error(arg)
+
+        print()
+        exit(1)
+
+
+if __name__ == '__main__':
+    main()
